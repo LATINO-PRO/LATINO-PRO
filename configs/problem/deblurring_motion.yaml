@@ -1,0 +1,3 @@
+type: deblurring_motion
+kernel_index: 3 # which kernel to chose among the 8 motion kernels from 'Levin09.mat' in [0, 7]
+sigma_y: 0.01

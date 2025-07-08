@@ -1,0 +1,10 @@
+log_subfolder: test
+
+defaults:
+  - problem: deblurring_gaussian
+  - image: face
+
+seed: 42
+model: TREG
+num_SAPG_steps: 15  # For LATINO-PRO
+init_strategy: "y_noise"

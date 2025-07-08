@@ -1,0 +1,4 @@
+type: super_resolution_bicubic
+downscaling_factor: 8
+sigma_y: 0.01
+sigma_filter: 12
