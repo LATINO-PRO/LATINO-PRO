@@ -25,7 +25,7 @@ No custom CUDA extensions are required; GPU acceleration is handled automaticall
 
 ## 🚀 Quick start
 
-The repository contains two ready‑to‑run entry points. **All hyper‑parameters are controlled by the YAML files inside the **configs** directory**, so the basic usage is simply:
+The repository contains two ready‑to‑run scripts. **All hyper‑parameters are controlled by the YAML files inside the **configs** directory**, so the basic usage is simply:
 
 ```bash
 # Baseline LATINO model
