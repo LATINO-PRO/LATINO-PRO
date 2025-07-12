@@ -1,32 +1,38 @@
 import os
 import json
-from PIL import Image
-import torch
-from torch import nn
-import torchmetrics
-import torch.nn.functional as F
-import numpy as np
-import csv
 import time
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
-from diffusers import AutoencoderKL, UNet2DConditionModel, DiffusionPipeline, LCMScheduler, AutoPipelineForText2Image
-from huggingface_hub import hf_hub_download
-from motionblur import Kernel
 import deepinv as dinv
 from torchvision.utils import save_image
-
-from omegaconf import DictConfig, OmegaConf
-import hydra
 import random
-
+import torch
+import torchmetrics
+import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import csv
+from diffusers import (
+    AutoencoderKL,
+    UNet2DConditionModel,
+    DiffusionPipeline,
+    LCMScheduler,
+)
+from huggingface_hub import hf_hub_download
+from omegaconf import DictConfig, OmegaConf
+import hydra
 
-from utils import load_image_tensor, crop_to_multiple, get_filename_from_path, find_available_filename, _get_x_init
+from utils import (
+    load_image_tensor,
+    crop_to_multiple,
+    get_filename_from_path,
+    find_available_filename,
+    _get_x_init,
+)
+from inverse_problems import get_forward_model
+from noise_schemes import (
+    noise_pred_cond_y_PRO,
+)
 
-@hydra.main(version_base=None, config_path="configs", config_name="test")
+@hydra.main(version_base=None, config_path="configs", config_name="LATINO-PRO")
 def main(cfg: DictConfig) -> None:
     # Set global random seeds for full reproducibility
     seed = cfg.seed
@@ -58,7 +64,6 @@ def main(cfg: DictConfig) -> None:
     vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     pipe = DiffusionPipeline.from_pretrained(base_model_id, unet=unet, vae=vae, torch_dtype=torch.float16, variant="fp16", guidance_scale=0).to(device)
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    #prompt="High resolution photorealistic image of a man face, front view with all the head in the picture, blurred background."
     prompt = "a photo of " + cfg.image.prompt
 
     # Encode text to conditioning
@@ -69,11 +74,7 @@ def main(cfg: DictConfig) -> None:
         do_classifier_free_guidance=False
     )
 
-    text_embeddings = nn.Parameter(text_embeddings.clone().half())
-    text_embeddings = text_embeddings.to(device)
-
-    pooled_text_embeds = nn.Parameter(pooled_text_embeds.clone().half())
-    pooled_text_embeds = pooled_text_embeds.to(device)
+    text_embeddings.requires_grad = True  # Enable gradients for text embeddings
 
     # Create a random generator
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -138,96 +139,8 @@ def main(cfg: DictConfig) -> None:
 
     x_clean = (x_clean - x_clean.min())/(x_clean.max() - x_clean.min())
 
-    H, W = x_clean.shape[-2:]
-
-    # load forward model
-    noise_model = dinv.physics.GaussianNoise(sigma=cfg.problem.sigma_y)
-
-    if cfg.problem.type == 'inpainting_squared_mask':
-        # Get tensor dimensions
-        B, C, H, W = x_clean.shape  # [1, 3, 1024, 1024]
-
-        # Create a binary mask (1 outside the mask, 0 inside)
-        mask = torch.ones((1, H, W), device=x_clean.device)  # Shape: [1, 1024, 1024]
-        size = cfg.problem.mask_size
-
-        # Define the inpainting mask region (hard edges)
-        mask[:, H//2 - size//5 - 35: H//2 + size//5 - 35, W//2 - 4*size//5 - 2: W//2 + 4*size//5 + 2] = 0  # Shape remains [1, 1024, 1024]
-
-        # Define forward model
-        forward_model = dinv.physics.Inpainting(tensor_size=x_clean.shape, mask=mask, noise_model=noise_model).to(device)
-        transpose_operator = forward_model.A_adjoint
-    elif cfg.problem.type == 'deblurring_gaussian':
-        ksize = cfg.problem.sigma_kernel
-        filter = dinv.physics.blur.gaussian_blur(sigma=ksize)
-        forward_model = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=filter,
-            device=device,
-            noise_model=noise_model
-        )
-        transpose_operator = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=filter,
-            device=device,
-            noise_model=noise_model
-        ).A_adjoint
-    elif cfg.problem.type == 'deblurring_motion': 
-        kernel = Kernel(size=(122, 122), intensity=0.5)
-        kernel_torch = torch.tensor(kernel.kernelMatrix, dtype=torch.float32).to(device)
-        kernel_torch = kernel_torch.unsqueeze(0).unsqueeze(0)
-        
-        forward_model = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=kernel_torch,
-            device=device,
-            noise_model=noise_model
-        )
-        transpose_operator = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=kernel_torch,
-            device=device,
-            noise_model=noise_model
-        ).A_adjoint
-    elif cfg.problem.type == 'super_resolution':
-        filter = dinv.physics.blur.gaussian_blur(sigma=cfg.problem.sigma_filter)
-        forward_model = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = filter
-            )
-        transpose_operator = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = filter
-            ).A_adjoint
-    # Define the super-resolution operator with bicubic interpolation
-    elif cfg.problem.type == 'super_resolution_bicubic':
-        forward_model = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = "bicubic",
-            padding = "reflect"
-            )
-        transpose_operator = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = "bicubic",
-            padding = "reflect"
-            ).A_adjoint
-    elif cfg.problem.type == 'colorization':
-        forward_model = dinv.physics.Decolorize(noise_model=noise_model).to(device)
-    else:
-        raise ValueError(f'unexpected problem.type {cfg.problem.type}. Expected value are: inpainting_squared_mask, deblurring_gaussian, deblurring_motion, super_resolution_bicubic, colorization')
-
+    # Build forward and transpose operators
+    forward_model, transpose_operator = get_forward_model(cfg, x_clean, device)
     
     y = forward_model(x_clean)
     y_norm = y * 2 - 1
@@ -295,7 +208,7 @@ def main(cfg: DictConfig) -> None:
                 ).sample
             
             with torch.no_grad():
-                _, noise_pred =_noise_pred_cond_y(
+                _, noise_pred = noise_pred_cond_y_PRO(
                     latents=latents,
                     t = timestep,
                     pipe=pipe,
@@ -401,7 +314,6 @@ def main(cfg: DictConfig) -> None:
                 latents = latents2.clone()
                 pipe.scheduler.set_timesteps(num_inference_steps, device=device)
                 # Override the scheduler's timesteps with DMD2 values
-                #
                 # custom_timesteps = torch.tensor([999, 874, 749, 624, 499, 374, 249, 124], device=device, dtype=torch.long)
                 custom_timesteps = torch.tensor([999, 749, 499, 249], device=device, dtype=torch.long)
                 pipe.scheduler.timesteps = custom_timesteps
@@ -456,7 +368,7 @@ def main(cfg: DictConfig) -> None:
                     ).sample
                 
                 with torch.no_grad():
-                    _, noise_pred =_noise_pred_cond_y(
+                    _, noise_pred = noise_pred_cond_y_PRO(
                         latents=latents,
                         t = timestep,
                         pipe=pipe,
@@ -540,7 +452,7 @@ def main(cfg: DictConfig) -> None:
     if type(forward_model) == dinv.physics.Downsampling:
         restored_x_lr = forward_model.A(restored_x.float())
         lr_psnr = psnr_loss(((y_norm+1)/2).clamp(0, 1), restored_x_lr).item()
-        metrics['LR-PSNR'] = lr_psnr
+        metrics['OBS-PSNR'] = lr_psnr
 
     metric_string = ""
     for m in metrics:
@@ -550,135 +462,6 @@ def main(cfg: DictConfig) -> None:
     with open(os.path.join(xp_log_dir, 'metrics.csv'), 'w+') as f:
         f.write(json.dumps(metrics))
 
-def _noise_pred_cond_y(
-    latents,
-    t: int,
-    pipe,
-    cfg,
-    logdir,
-    y_guidance,
-    forward_model,
-    noise_pred,
-    sigma_y,
-    SAPG_j,
-    n_steps = 4
-):           
-    with torch.no_grad(): 
-        # Compute z0_pred
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_pred)
-
-        # decode
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
-        
-    df = torch.norm(forward_model(x.float()) - y_guidance).item()
-    decoder_std, decoder_L = 0.02, 1
-    var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
-    if cfg.problem.type == "super_resolution_bicubic":
-        if cfg.problem.sigma_y < 0.05:
-            if cfg.problem.downscaling_factor == 16:
-                if t>300:
-                    delta = 6*0.01*df/(1e2*sigma_y)
-                else:
-                    delta = 9*0.01*df/(1e2*sigma_y)
-            elif cfg.problem.downscaling_factor == 32:
-                if t>300:
-                    delta = 1.5*0.01*df/(1e0*sigma_y)
-                else:
-                    delta = 9*0.01*df/(1e1*sigma_y)
-            else:
-                delta = 1
-        else:
-            if cfg.problem.downscaling_factor == 16:
-                if n_steps ==4:
-                    if t>500:
-                        delta = 5*0.01*df/(1e0*sigma_y)
-                    else:
-                        delta = 8*0.01*df/(1e1*sigma_y)
-                else:
-                    if t>700:
-                        delta = 6*0.01*df/(1e0*sigma_y)
-                    else:
-                        delta = 2*0.01*df/(1e0*sigma_y)
-            elif cfg.problem.downscaling_factor == 32:
-                if t>300:
-                    delta = 15*0.01*df/(1e0*sigma_y)
-                else:
-                    delta = 9*0.01*df/(1e0*sigma_y)
-            else:
-                delta = 1
-    elif cfg.problem.type == 'deblurring_gaussian':
-        if cfg.problem.sigma_y < 0.05 and cfg.problem.sigma_kernel < 10:
-            if n_steps ==4:
-                if t>500:
-                    delta = 4*df/(1e3)
-                else:
-                    delta = 2*df/(1e3)
-            else:
-                if t>400:
-                    delta = 4*df/(1e3)
-                else:
-                    delta = 2*df/(1e3)
-            
-        elif cfg.problem.sigma_y < 0.05 and cfg.problem.sigma_kernel > 10:
-            if n_steps ==4:
-                if t>400:
-                    delta = 2*df/(1e2)
-                else:
-                    delta = 2*df/(1e3)
-            else:
-                if t>400:
-                    delta = 2*df/(1e2)
-                else:
-                    delta = 2*df/(1e3)
-        else:
-            if n_steps ==4:
-                if t>500:
-                    delta = 8*df/(1e3)
-                else:
-                    delta = 5*df/(1e3)
-            else:
-                if t>400:
-                    delta = 8*df/(1e3)
-                else:
-                    delta = 5*df/(1e3)
-    elif cfg.problem.type == 'deblurring_motion':
-        if n_steps ==4:
-            if t>500:
-                delta = 4*df/(1e4)
-            else:
-                delta = 5*df/(1e4)
-        else:
-            if t>400:
-                delta = 5*df/(1e4)
-            else:
-                delta = 9*df/(1e4)
-    else:
-        if t>200:
-            delta = 0.01
-        else:
-            delta = 1
-    print(f"delta at step {t}: ", "%.2f" % delta)
-
-    with torch.no_grad():
-        prox_x = forward_model.prox_l2(x.float(), y=y_guidance, gamma=delta*var_x_zt/(sigma_y**2))
-
-        # encode
-        qz= pipe.vae.encode(prox_x.clip(-1,1).half())
-        mu_z = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-    z0_pred_cond_y = mu_z
-
-    noise_pred_cond_y = torch.sqrt(1/(1-alpha_t))*latents - torch.sqrt(alpha_t/(1-alpha_t))*z0_pred_cond_y
-    log_image_dict = {'x': x, 'prox': prox_x}
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}_{SAPG_j}.png'))
-        
-    return z0_pred_cond_y, noise_pred_cond_y
 
 if __name__ == "__main__":
     main()

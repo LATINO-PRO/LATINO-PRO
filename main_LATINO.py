@@ -1,28 +1,47 @@
 import os
 import json
-import torch
-import torchmetrics
-import torch.nn.functional as F
-import numpy as np
-from motionblur import Kernel
 import time
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
-from transformers import CLIPProcessor, CLIPModel
-from diffusers import AutoencoderKL, UNet2DConditionModel, DiffusionPipeline, LCMScheduler, AutoPipelineForText2Image, DDIMScheduler, StableDiffusionPipeline
-from huggingface_hub import hf_hub_download
-
 import deepinv as dinv
 from torchvision.utils import save_image
-
+import random
+import torch
+import torchmetrics
+import numpy as np
+from transformers import CLIPProcessor, CLIPModel
+from diffusers import (
+    AutoencoderKL,
+    UNet2DConditionModel,
+    DiffusionPipeline,
+    LCMScheduler,
+    AutoPipelineForText2Image,
+    DDIMScheduler,
+    StableDiffusionPipeline,
+)
+from huggingface_hub import hf_hub_download
 from omegaconf import DictConfig, OmegaConf
 import hydra
-import random
 
-from utils import load_image_tensor, crop_to_multiple, get_filename_from_path, find_available_filename, _get_x_init
+from utils import (
+    load_image_tensor,
+    crop_to_multiple,
+    get_filename_from_path,
+    find_available_filename,
+    _get_x_init,
+)
+from inverse_problems import get_forward_model
+from noise_schemes import (
+    noise_pred_cond_y,
+    noise_pred_cond_y_15,
+    noise_pred_cond_y_DPS,
+    noise_pred_cond_y_PSLD,
+    noise_pred_cond_y_DPS_P2L,
+    noise_pred_cond_y_DPS_1024,
+    noise_pred_cond_y_PSLD_1024,
+    noise_pred_cond_y_DPS_1024_P2L,
+    noise_pred_cond_y_TReg,
+)
 
-@hydra.main(version_base=None, config_path="configs", config_name="test")
+@hydra.main(version_base=None, config_path="configs", config_name="LATINO")
 def main(cfg: DictConfig) -> None:
     # Set global random seeds for full reproducibility
     seed = cfg.seed
@@ -42,14 +61,6 @@ def main(cfg: DictConfig) -> None:
         # Load CLIP ViT-L/14
         clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-
-        # Load OpenCLIP ViT-bigG
-        #openclip_model, _, openclip_preprocess = open_clip.create_model_and_transforms(
-        #    'ViT-bigG-14',
-        #    pretrained='laion2b_s39b_b160k',
-        #    device=device
-        #)
-        #openclip_tokenizer = open_clip.get_tokenizer('ViT-bigG-14')
 
     # load stable diffusion
     if cfg.model in {"LATINO", "LDPS1024", "PSLD1024", "LDPS1024-P2L"}:
@@ -73,7 +84,7 @@ def main(cfg: DictConfig) -> None:
             pipe2 = DiffusionPipeline.from_pretrained(
                 base_model_id,
                 torch_dtype=torch.float32,       # full precision to avoid float16 issues with autograd
-                use_safetensors=True             # looks for diffusion_pytorch_model.safetensors
+                use_safetensors=True 
             ).to(device)
 
             unet = pipe2.unet
@@ -129,7 +140,7 @@ def main(cfg: DictConfig) -> None:
             num_channels_latents=pipe.unet.config.in_channels,  # latent channels
             height=image_height,  # image height
             width=image_width,   # image width
-            dtype=torch.float16,  # datatype
+            dtype=torch.float16 if cfg.model == "LATINO" else torch.float32,  # datatype
             device=device,  # Corrected device type
             generator=generator  # Random number generator
         )
@@ -139,7 +150,7 @@ def main(cfg: DictConfig) -> None:
             original_size=(image_height, image_width),  # The original image resolution
             crops_coords_top_left=(0, 0),  # No cropping
             target_size=(image_height, image_width),  # Target resolution
-            dtype=torch.float16,  # Ensure correct data type
+            dtype=torch.float16 if cfg.model == "LATINO" else torch.float32,  # Ensure correct data type
             text_encoder_projection_dim=1280
         ).to(device)
         
@@ -278,82 +289,9 @@ def main(cfg: DictConfig) -> None:
     
     x_clean = (x_clean - x_clean.min())/(x_clean.max() - x_clean.min())
 
-    H, W = x_clean.shape[-2:]
-
-    # load forward model
-    noise_model = dinv.physics.GaussianNoise(sigma=cfg.problem.sigma_y)
-
-
-    if cfg.problem.type == 'inpainting_squared_mask':
-        # Get tensor dimensions
-        B, C, H, W = x_clean.shape  # [1, 3, 1024, 1024]
-
-        # Create a binary mask (1 outside the mask, 0 inside)
-        mask = torch.ones((1, H, W), device=x_clean.device)  # Shape: [1, 1024, 1024]
-        size = cfg.problem.mask_size
-
-        # Define the inpainting mask region (hard edges)
-        mask[:, H//2 - size//5 - 35: H//2 + size//5 - 35, W//2 - 4*size//5 - 2: W//2 + 4*size//5 + 2] = 0  # Shape remains [1, 1024, 1024]
-
-        # Define forward model
-        forward_model = dinv.physics.Inpainting(tensor_size=x_clean.shape, mask=mask, noise_model=noise_model).to(device)
-        transpose_operator = forward_model.A_adjoint
+    # Build forward and transpose operators
+    forward_model, transpose_operator = get_forward_model(cfg, x_clean, device)
     
-    elif cfg.problem.type == 'deblurring_gaussian':
-        ksize = cfg.problem.sigma_kernel
-        filter = dinv.physics.blur.gaussian_blur(sigma=(ksize, ksize))
-        forward_model = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=filter,
-            device=device,
-            noise_model=noise_model
-        )
-        transpose_operator = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=filter,
-            device=device,
-            noise_model=noise_model
-        ).A_adjoint
-    elif cfg.problem.type == 'deblurring_motion': 
-        kernel = Kernel(size=(122, 122), intensity=0.5)
-        kernel_torch = torch.tensor(kernel.kernelMatrix, dtype=torch.float32).to(device)
-        kernel_torch = kernel_torch.unsqueeze(0).unsqueeze(0)
-
-        forward_model = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=kernel_torch,
-            device=device,
-            noise_model=noise_model
-        )
-        transpose_operator = dinv.physics.BlurFFT(
-            img_size=x_clean.shape[1:],
-            filter=kernel_torch,
-            device=device,
-            noise_model=noise_model
-        ).A_adjoint
-    # Define the super-resolution operator with bicubic interpolation
-    elif cfg.problem.type == 'super_resolution_bicubic':
-        forward_model = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = "bicubic",
-            padding = "reflect"
-            )
-        transpose_operator = dinv.physics.Downsampling(
-            img_size=x_clean.shape[1:],
-            factor=cfg.problem.downscaling_factor,
-            device=device,
-            noise_model=noise_model,
-            filter = "bicubic",
-            padding = "reflect"
-            ).A_adjoint
-    elif cfg.problem.type == 'colorization':
-        forward_model = dinv.physics.Decolorize(noise_model=noise_model).to(device)
-    else:
-        raise ValueError(f'unexpected problem.type {cfg.problem.type}. Expected value are: inpainting_squared_mask, deblurring_gaussian, deblurring_motion, super_resolution_bicubic, colorization')
-
     y = forward_model(x_clean)
     y_norm = y * 2 - 1
     sigma_y_norm = cfg.problem.sigma_y * 2
@@ -436,7 +374,7 @@ def main(cfg: DictConfig) -> None:
                 ).sample
 
             with torch.no_grad():
-                _, noise_pred =_noise_pred_cond_y(
+                _, noise_pred = noise_pred_cond_y(
                     latents=latents,
                     t = timestep,
                     pipe=pipe,
@@ -447,78 +385,9 @@ def main(cfg: DictConfig) -> None:
                     noise_pred=noise_uncond,
                     sigma_y=sigma_y_norm
                 )
-        elif cfg.model == "LDPS1024-P2L":
-            with torch.autocast(device_type="cuda", enabled=False):
-                # Modify hyperparameters for P2L according to Table 6 in the paper: # https://arxiv.org/pdf/2310.01110
-                for _ in range(5):
-                    text_embeddings = text_embeddings.detach().requires_grad_(True)
-                    text_embeddings_cfg = torch.cat([uncond_embeddings, text_embeddings], dim=0)
-                    with torch.enable_grad():
-                        noise_uncond = pipe.unet(
-                            latents, 
-                            timestep, 
-                            encoder_hidden_states=text_embeddings, 
-                            added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
-                        ).sample
-
-                        alpha_t = pipe.scheduler.alphas_cumprod[timestep]
-
-                        z0_pred_c = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_uncond)
-                        # decode
-                        x = pipe.vae.decode(z0_pred_c / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
-
-                        # Rescale from [-1, 1] to [0, 1]
-                        x = (x + 1) / 2
-
-                        model_output = forward_model(x.float()).clamp(-1, 1)
-
-                        loss = torch.norm(y_norm - model_output)
-
-                        gradients = torch.autograd.grad(loss, inputs=text_embeddings, retain_graph=False)[0]
-
-                    # Adam update step (done in float32)
-                    t_step += 1
-                    m = beta1 * m + (1 - beta1) * gradients  # First moment estimate (momentum)
-                    v = beta2 * v + (1 - beta2) * (gradients ** 2)  # Second moment estimate (adaptive scaling)
-
-                    # Bias correction
-                    m_hat = m / (1 - beta1 ** t_step)
-                    v_hat = v / (1 - beta2 ** t_step)
-
-                    # **Fix: Ensure v_hat is never zero (prevents division by zero)**
-                    v_hat = torch.clamp(v_hat, min=epsilon)
-
-                    # Update text embeddings with Adam (convert back to float16)
-                    text_embeddings = text_embeddings - (lr / torch.sqrt(v_hat)) * m_hat
-                    text_embeddings = text_embeddings.to(torch.float16)
-
-            noise_pred, grad_nll =_noise_pred_cond_y_DPS_1024_P2L(
-                latents=latents,
-                t = timestep,
-                pipe=pipe,
-                text_embeddings=text_embeddings,
-                added_cond_kwargs=added_cond_kwargs,
-                logdir=xp_log_dir,
-                y_guidance=y_norm,
-                forward_model=forward_model
-            )
-        elif cfg.model == "PSLD1024":
-            # Call the denoiser with transformed latents           
-            with torch.enable_grad():
-                noise_pred, grad_nll =_noise_pred_cond_y_PSLD_1024(
-                    latents=latents,
-                    t = timestep,
-                    pipe=pipe,
-                    text_embeddings=text_embeddings,
-                    added_cond_kwargs=added_cond_kwargs,
-                    logdir=xp_log_dir,
-                    y_guidance=y_norm,
-                    forward_model=forward_model,
-                    transpose_model=transpose_operator
-                )
         elif cfg.model == "LATINO-1.5":
             with torch.no_grad():
-                noise_pred =_noise_pred_cond_y_15(
+                noise_pred = noise_pred_cond_y_15(
                     latents=latents,
                     t=timestep,
                     encoder_hidden_states=text_embeddings_cfg,
@@ -530,13 +399,48 @@ def main(cfg: DictConfig) -> None:
                     forward_model=forward_model,
                     sigma_y=sigma_y_norm
                 )
-        elif cfg.model == "PSLD":
-            noise_pred, grad_nll =_noise_pred_cond_y_PSLD(
+        elif cfg.model == "LDPS":
+            noise_pred, grad_nll = noise_pred_cond_y_DPS(
                 latents=latents,
                 t=timestep,
                 encoder_hidden_states=text_embeddings_cfg,
                 guidance_scale=guidance_scale,
                 pipe=pipe,
+                logdir=xp_log_dir,
+                y_guidance=y_norm,
+                forward_model=forward_model
+            )
+        elif cfg.model == "LDPS1024":
+            noise_pred, grad_nll = noise_pred_cond_y_DPS_1024(
+                latents=latents,
+                t = timestep,
+                pipe=pipe,
+                text_embeddings=text_embeddings,
+                added_cond_kwargs=added_cond_kwargs,
+                logdir=xp_log_dir,
+                y_guidance=y_norm,
+                forward_model=forward_model
+            )
+        elif cfg.model == "PSLD":
+            noise_pred, grad_nll = noise_pred_cond_y_PSLD(
+                latents=latents,
+                t=timestep,
+                encoder_hidden_states=text_embeddings_cfg,
+                guidance_scale=guidance_scale,
+                pipe=pipe,
+                logdir=xp_log_dir,
+                y_guidance=y_norm,
+                forward_model=forward_model,
+                transpose_model=transpose_operator
+            )
+        elif cfg.model == "PSLD1024":
+            # Call the denoiser with transformed latents           
+            noise_pred, grad_nll = noise_pred_cond_y_PSLD_1024(
+                latents=latents,
+                t=timestep,
+                pipe=pipe,
+                text_embeddings=text_embeddings,
+                added_cond_kwargs=added_cond_kwargs,
                 logdir=xp_log_dir,
                 y_guidance=y_norm,
                 forward_model=forward_model,
@@ -596,7 +500,7 @@ def main(cfg: DictConfig) -> None:
                 text_embeddings = text_embeddings - (lr / torch.sqrt(v_hat)) * m_hat
                 text_embeddings = text_embeddings.to(torch.float16)
             
-            noise_pred, grad_nll =_noise_pred_cond_y_DPS_P2L(
+            noise_pred, grad_nll = noise_pred_cond_y_DPS_P2L(
                 latents=latents,
                 t=timestep,
                 encoder_hidden_states=text_embeddings_cfg,
@@ -606,19 +510,52 @@ def main(cfg: DictConfig) -> None:
                 y_guidance=y_norm,
                 forward_model=forward_model
             )
-        elif cfg.model == "LDPS":
-            noise_pred, grad_nll =_noise_pred_cond_y_DPS(
-                latents=latents,
-                t=timestep,
-                encoder_hidden_states=text_embeddings_cfg,
-                guidance_scale=guidance_scale,
-                pipe=pipe,
-                logdir=xp_log_dir,
-                y_guidance=y_norm,
-                forward_model=forward_model
-            )
-        elif cfg.model == "LDPS1024":
-            noise_pred, grad_nll = _noise_pred_cond_y_DPS_1024(
+        elif cfg.model == "LDPS1024-P2L":
+            with torch.autocast(device_type="cuda", enabled=False):
+                # Modify hyperparameters for P2L according to Table 6 in the paper: # https://arxiv.org/pdf/2310.01110
+                for _ in range(5):
+                    text_embeddings = text_embeddings.detach().requires_grad_(True)
+                    text_embeddings_cfg = torch.cat([uncond_embeddings, text_embeddings], dim=0)
+                    with torch.enable_grad():
+                        noise_uncond = pipe.unet(
+                            latents, 
+                            timestep, 
+                            encoder_hidden_states=text_embeddings, 
+                            added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
+                        ).sample
+
+                        alpha_t = pipe.scheduler.alphas_cumprod[timestep]
+
+                        z0_pred_c = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_uncond)
+                        # decode
+                        x = pipe.vae.decode(z0_pred_c / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
+
+                        # Rescale from [-1, 1] to [0, 1]
+                        x = (x + 1) / 2
+
+                        model_output = forward_model(x.float()).clamp(-1, 1)
+
+                        loss = torch.norm(y_norm - model_output)
+
+                        gradients = torch.autograd.grad(loss, inputs=text_embeddings, retain_graph=False)[0]
+
+                    # Adam update step (done in float32)
+                    t_step += 1
+                    m = beta1 * m + (1 - beta1) * gradients  # First moment estimate (momentum)
+                    v = beta2 * v + (1 - beta2) * (gradients ** 2)  # Second moment estimate (adaptive scaling)
+
+                    # Bias correction
+                    m_hat = m / (1 - beta1 ** t_step)
+                    v_hat = v / (1 - beta2 ** t_step)
+
+                    # **Fix: Ensure v_hat is never zero (prevents division by zero)**
+                    v_hat = torch.clamp(v_hat, min=epsilon)
+
+                    # Update text embeddings with Adam (convert back to float16)
+                    text_embeddings = text_embeddings - (lr / torch.sqrt(v_hat)) * m_hat
+                    text_embeddings = text_embeddings.to(torch.float16)
+
+            noise_pred, grad_nll = noise_pred_cond_y_DPS_1024_P2L(
                 latents=latents,
                 t = timestep,
                 pipe=pipe,
@@ -665,7 +602,7 @@ def main(cfg: DictConfig) -> None:
                         # decode
                         x = pipe.vae.decode(z0_pred_c / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
 
-                        z0_predy, x = _noise_pred_cond_y_TReg(
+                        z0_predy, x = noise_pred_cond_y_TReg(
                             x=x,
                             z0_pred=z0_pred_c,
                             pipe=pipe,
@@ -759,7 +696,6 @@ def main(cfg: DictConfig) -> None:
     # Print execution time
     print(f"Execution Time: {end_time - start_time:.6f} seconds")
 
-
     save_image(restored_x, os.path.join(xp_log_dir, "restored.png"))
     save_image(((y_norm+1)/2).clamp(0, 1).detach().cpu(), os.path.join(xp_log_dir, "degraded.png"))
     save_image(x_clean.detach().cpu(), os.path.join(xp_log_dir, "clean.png"))
@@ -780,7 +716,7 @@ def main(cfg: DictConfig) -> None:
     if type(forward_model) == dinv.physics.Downsampling:
         restored_x_lr = forward_model.A(restored_x.float())
         lr_psnr = psnr_loss(((y_norm+1)/2).clamp(0, 1), restored_x_lr).item()
-        metrics['LR-PSNR'] = lr_psnr
+        metrics['OBS-PSNR'] = lr_psnr
 
     metric_string = ""
     for m in metrics:
@@ -789,511 +725,6 @@ def main(cfg: DictConfig) -> None:
 
     with open(os.path.join(xp_log_dir, 'metrics.csv'), 'w+') as f:
         f.write(json.dumps(metrics))
-
-def _noise_pred_cond_y(
-        latents,
-        t: int,
-        pipe,
-        cfg,
-        logdir,
-        y_guidance,
-        forward_model,
-        noise_pred,
-        sigma_y
-    ):           
-        with torch.no_grad(): 
-            # Compute z0_pred
-            alpha_t = pipe.scheduler.alphas_cumprod[t]
-            z0_pred = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_pred)
-
-            # decode
-            x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
-            
-        df = torch.norm(forward_model(x.float()) - y_guidance).item()
-        decoder_std, decoder_L = 0.02, 1
-        var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
-        if cfg.problem.type == "super_resolution_bicubic":
-            if cfg.problem.downscaling_factor == 16:
-                if t>300:
-                    delta = 3*df/1e1
-                else:
-                    delta = 2*df/1e1
-            elif cfg.problem.downscaling_factor == 32:
-                if t>300:
-                    delta = 1.5*0.01*df/(1e0*sigma_y)
-                else:
-                    delta = 9*0.01*df/(1e1*sigma_y)
-        elif cfg.problem.type == 'deblurring_gaussian':
-            if cfg.problem.sigma_kernel<10:
-                if t>400:
-                    delta = 5*df/(1e4)
-                else:
-                    delta = 2*df/(1e4)
-            else:
-                if t>400:
-                    delta = 7*df/(1e4)
-                else:
-                    delta = 3*df/(1e4)
-        elif cfg.problem.type == 'deblurring_motion':
-            if cfg.problem.sigma_y==0.01:
-                if t>400:
-                    delta = 4*df/(1e4)
-                else:
-                    delta = 2*df/(1e4)
-            else:
-                if t>400:
-                    delta = 5*df/(1e5)
-                elif t>0:
-                    delta = 9*df/(1e5)
-                else:
-                    delta = 2*df/(1e7)
-        elif cfg.problem.type == 'inpainting_squared_mask':
-            if t>500:
-                delta = 1
-            else:
-                delta = 0.5
-        else:
-            if t>200:
-                delta = 0.01
-            else:
-                delta = 1
-        print(f"delta at step {t}: ", "%.2f" % delta)
-        with torch.no_grad():
-            gamma = delta*var_x_zt/(sigma_y**2)
-            gamma = gamma.to(device=latents.device)
-            prox_x = forward_model.prox_l2(x.float(), y=y_guidance, gamma=gamma)
-
-            # encode
-            qz= pipe.vae.encode(prox_x.clip(-1,1).half())
-            mu_z = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-            z0_pred_cond_y = mu_z
-
-            noise_pred_cond_y = torch.sqrt(1/(1-alpha_t))*latents - torch.sqrt(alpha_t/(1-alpha_t))*z0_pred_cond_y
-        log_image_dict = {'x': x, 'prox': prox_x}
-
-        logdir_iter = os.path.join(logdir, 'iter')
-        os.makedirs(logdir_iter, exist_ok=True)
-        
-        for k, v in log_image_dict.items():
-            save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-            
-        return z0_pred_cond_y, noise_pred_cond_y
-
-def _noise_pred_cond_y_15(
-    latents,
-    t: int,
-    encoder_hidden_states,
-    guidance_scale,
-    pipe,
-    cfg,
-    logdir,
-    y_guidance,
-    forward_model,
-    sigma_y
-):
-    with torch.no_grad():
-        latent_model_input = torch.cat([latents] * 2, dim=0)
-
-        # Format timestep correctly
-        t_tensor = torch.tensor([t], dtype=torch.float16).to("cuda")
-
-        # Forward pass through UNet
-        noise_pred = pipe.unet(
-            latent_model_input, 
-            t_tensor, 
-            encoder_hidden_states=encoder_hidden_states
-        ).sample
-
-        # Split the outputs for CFG
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        # Compute z0_pred
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_pred)
-
-    # decode
-    with torch.no_grad():
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
-    df = torch.norm(forward_model(x.float()) - y_guidance).item()
-    decoder_std, decoder_L = 0.02, 1
-    var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
-    #var_x_zt = self.decoder_std**2 + (1-alpha_t)/alpha_t * self.decoder_L**2
-    if cfg.problem.type == "super_resolution_bicubic":
-        if cfg.problem.downscaling_factor == 16:
-            if t>300:
-                delta = 1*0.02*df/(1e0*sigma_y)
-            else:
-                delta = 1*0.02*df/(1e1*sigma_y)
-        elif cfg.problem.downscaling_factor == 32:
-            if t>300:
-                delta = 2*df/(1e0)
-            else:
-                delta = 9*df/(1e1)
-    elif cfg.problem.type == 'inpainting_squared_mask':
-        if t>500:
-            delta = 1
-        else:
-            delta = 0.5
-    elif cfg.problem.type == 'deblurring_gaussian':
-        if t>300:
-            delta = 1*df/(1e3)
-        else:
-            delta = 4*df/(1e4)
-    elif cfg.problem.type == 'deblurring_motion':
-        if t>400:
-            delta = 8*df/(1e4)
-        else:
-            delta = 7*df/(1e4)
-    else:
-        if t>200:
-            delta = 0.01
-        else:
-            delta = 1
-    print(f"delta at step {t}: ", "%.2f" % delta)
-    with torch.no_grad():
-        prox_x = forward_model.prox_l2(x.float().detach().clone(), y=y_guidance, gamma=delta*var_x_zt/(sigma_y**2))
-    # encode
-    with torch.no_grad():
-        qz= pipe.vae.encode(prox_x.clip(-1,1).half())
-    mu_z = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-    z0_pred_cond_y = mu_z
-
-    noise_pred_cond_y = torch.sqrt(1/(1-alpha_t))*latents - torch.sqrt(alpha_t/(1-alpha_t))*z0_pred_cond_y
-    log_image_dict = {'x': x, 'prox': prox_x}
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-        
-    return noise_pred_cond_y
-
-def _noise_pred_cond_y_DPS(
-    latents,
-    t: int,
-    encoder_hidden_states,
-    guidance_scale,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-
-        # Expand latents for unconditional/conditional input for CFG
-        latent_model_input = torch.cat([latents] * 2, dim=0)
-
-        # Format timestep correctly
-        t_tensor = torch.tensor([t], dtype=torch.float16).to("cuda")
-
-        # Forward pass through UNet
-        noise_pred = pipe.unet(
-            latent_model_input, 
-            t_tensor, 
-            encoder_hidden_states=encoder_hidden_states
-        ).sample
-
-        # Split the outputs for CFG
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample
-
-        nlogpyx = torch.linalg.norm((forward_model.A(x.float())-y_guidance))
-        print("loss: ", nlogpyx.item())
-        # compute neg log liklihood gradient
-    grad_nll = torch.autograd.grad(nlogpyx, latents)[0]
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred, grad_nll
-
-def _noise_pred_cond_y_PSLD(
-    latents,
-    t: int,
-    encoder_hidden_states,
-    guidance_scale,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model,
-    transpose_model
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-
-        # Expand latents for unconditional/conditional input for CFG
-        latent_model_input = torch.cat([latents] * 2, dim=0)
-
-        # Format timestep correctly
-        t_tensor = torch.tensor([t], dtype=torch.float16).to("cuda")
-
-        # Forward pass through UNet
-        noise_pred = pipe.unet(
-            latent_model_input, 
-            t_tensor, 
-            encoder_hidden_states=encoder_hidden_states
-        ).sample
-
-        # Split the outputs for CFG
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample
-
-        meas_pred = forward_model.A(x.float())
-        meas_error = torch.linalg.norm((meas_pred-y_guidance))
-        print("loss: ", meas_error.item())
-        # This computes x_0*
-        ortho_project = x.float() - transpose_model(meas_pred)
-        parallel_project = transpose_model(y_guidance)
-        inpainted_image = parallel_project + ortho_project
-        
-        encoded_z_0 = pipe.vae.encode(inpainted_image.type(torch.float16).clip(-1,1)).latent_dist.mean * pipe.vae.config.scaling_factor
-        inpaint_error = torch.linalg.norm((encoded_z_0 - z0_pred))
-        print("gluing loss: ", inpaint_error.item())
-
-        gamma, omega = 1e-1, 1
-        error = inpaint_error * gamma + meas_error * omega
-    gradients = torch.autograd.grad(error, inputs = latents)[0]
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred, gradients
-
-def _noise_pred_cond_y_DPS_P2L(
-    latents,
-    t: int,
-    encoder_hidden_states,
-    guidance_scale,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-
-        # Expand latents for unconditional/conditional input for CFG
-        latent_model_input = torch.cat([latents] * 2, dim=0)
-
-        # Format timestep correctly
-        t_tensor = torch.tensor([t], dtype=torch.float16).to("cuda")
-
-        # Forward pass through UNet
-        noise_pred = pipe.unet(
-            latent_model_input, 
-            t_tensor, 
-            encoder_hidden_states=encoder_hidden_states
-        ).sample
-
-        # Split the outputs for CFG
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample.clip(-1, 1)
-
-        nlogpyx = torch.linalg.norm((forward_model.A(x.float())-y_guidance))
-        print("loss: ", nlogpyx.item())
-        # compute neg log liklihood gradient
-    grad_nll = torch.autograd.grad(nlogpyx, latents)[0]
-
-    # modify hyperparm according to Table 6 in the paper: # https://arxiv.org/pdf/2310.01110
-    if t%8 == 1:
-        with torch.no_grad(): 
-            prox_x = forward_model.prox_l2(x.float(), y=y_guidance, gamma=1)
-
-            # encode
-            qz= pipe.vae.encode(prox_x.clip(-1,1).half())
-            z0_pred = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-    noise_pred_cond_y = torch.sqrt(1/(1-alpha_t))*latents - torch.sqrt(alpha_t/(1-alpha_t))*z0_pred.detach()
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred_cond_y, grad_nll
-
-def _noise_pred_cond_y_DPS_1024(
-    latents,
-    t: int,
-    text_embeddings,
-    added_cond_kwargs,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-        noise_pred = pipe.unet(
-            latents, 
-            t, 
-            encoder_hidden_states=text_embeddings, 
-            added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
-        ).sample
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample
-
-        nlogpyx = torch.linalg.norm((forward_model.A(x.float())-y_guidance))
-        print("loss: ", nlogpyx.item())
-        # compute neg log liklihood gradient
-    grad_nll = torch.autograd.grad(nlogpyx, latents)[0]
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred, grad_nll
-
-def _noise_pred_cond_y_PSLD_1024(
-    latents,
-    t: int,
-    text_embeddings,
-    added_cond_kwargs,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model,
-    transpose_model,
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-        noise_pred = pipe.unet(
-            latents, 
-            t, 
-            encoder_hidden_states=text_embeddings, 
-            added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
-        ).sample
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample
-
-        meas_pred = forward_model.A(x.float())
-        meas_error = torch.linalg.norm((meas_pred-y_guidance))
-        print("loss: ", meas_error.item())
-        # This computes x_0*
-        ortho_project = x.float() - transpose_model(meas_pred)
-        parallel_project = transpose_model(y_guidance)
-        inpainted_image = parallel_project + ortho_project
-        
-        encoded_z_0 = pipe.vae.encode(inpainted_image.type(torch.float16).clip(-1,1)).latent_dist.mean * pipe.vae.config.scaling_factor
-        inpaint_error = torch.linalg.norm((encoded_z_0 - z0_pred))
-        print("gluing loss: ", inpaint_error.item())
-
-        gamma, omega = 1e-1, 1
-        error = inpaint_error * gamma + meas_error * omega
-    gradients = torch.autograd.grad(error, inputs = latents)[0]
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred, gradients
-
-def _noise_pred_cond_y_DPS_1024_P2L(
-    latents,
-    t: int,
-    text_embeddings,
-    added_cond_kwargs,
-    pipe,
-    logdir,
-    y_guidance,
-    forward_model
-):
-    with torch.enable_grad():
-        latents = latents.detach().requires_grad_(True)
-        noise_pred = pipe.unet(
-            latents, 
-            t, 
-            encoder_hidden_states=text_embeddings, 
-            added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
-        ).sample
-        
-        alpha_t = pipe.scheduler.alphas_cumprod[t]
-        z0_pred = torch.sqrt(1/alpha_t)*(latents - torch.sqrt(1-alpha_t)*noise_pred)
-
-        # compute approximate log likelihood ||AD(z_0) -latents ||^2 / (2 sigma**2)
-        x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor).sample
-
-        nlogpyx = torch.linalg.norm((forward_model.A(x.float())-y_guidance))
-        print("loss: ", nlogpyx.item())
-        # compute neg log liklihood gradient
-    grad_nll = torch.autograd.grad(nlogpyx, latents)[0]
-
-    # modify hyperparm according to Table 6 in the paper: # https://arxiv.org/pdf/2310.01110
-    if t%8 == 1:
-        with torch.no_grad(): 
-            prox_x = forward_model.prox_l2(x.float(), y=y_guidance, gamma=1)
-
-            # encode
-            qz= pipe.vae.encode(prox_x.clip(-1,1))
-            z0_pred = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-    noise_pred_cond_y = torch.sqrt(1/(1-alpha_t))*latents - torch.sqrt(alpha_t/(1-alpha_t))*z0_pred.detach()
-
-    logdir_iter = os.path.join(logdir, 'iter')
-    os.makedirs(logdir_iter, exist_ok=True)
-    log_image_dict = {'x': x}
-
-    for k, v in log_image_dict.items():
-        save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{t:3d}_{k}.png'))
-    return noise_pred_cond_y, grad_nll
-
-def _noise_pred_cond_y_TReg(
-    x,
-    z0_pred,
-    pipe,
-    y_guidance,
-    forward_model,
-):
-    with torch.no_grad():
-        with torch.no_grad():
-            prox_x = forward_model.prox_l2(x.float().detach().clone(), y=y_guidance, gamma=1e4) # gamma=1/lambda used in TReg
-        # encode
-        with torch.no_grad():
-            qz= pipe.vae.encode(prox_x.clip(-1,1).half())
-        z0_pred = qz.latent_dist.mean * pipe.vae.config.scaling_factor
-
-    return z0_pred, prox_x
 
 if __name__ == "__main__":
     main()

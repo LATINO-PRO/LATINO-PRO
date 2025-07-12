@@ -8,8 +8,8 @@ omegaconf==2.3.0
 Pillow==10.2.0
 safetensors==0.5.3
 scipy==1.11.4
-torch==2.1.2+cu121
-torchvision==0.16.2+cu121
+torch
+torchvision
 torchmetrics==1.6.1
 tqdm==4.67.1
 transformers==4.48.0
