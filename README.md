@@ -29,10 +29,10 @@ The repository contains two ready‑to‑run scripts. **All hyper‑parameters a
 
 ```bash
 # Baseline LATINO model
-python main_LATINO.py            # uses configs/test.yaml by default
+python main_LATINO.py            # uses configs/LATINO.yaml by default
 
 # Prompt‑optimized LATINO‑PRO model
-python main_LATINO_PRO.py        # uses configs/test.yaml by default
+python main_LATINO_PRO.py        # uses configs/LATINO_PRO.yaml by default
 ```
 
 ---
@@ -54,9 +54,12 @@ LATINO-PRO/
 ├── samples/              # example images for tests
 ├── LATINO.ipynb          # baseline interactive notebook
 ├── LATINO_PRO.ipynb      # full prompt‑optimization notebook
+├── LICENSE               # License
+├── inverse_problems.py   # deepinverse operators are defined here
 ├── main_LATINO.py        # base LATINO restoration
 ├── main_LATINO_PRO.py    # prompt‑optimized restoration
 ├── motionblur.py         # helper code for motion‑blur degradations
+├── noise_schemes.py      # definition of various inverse solvers
 ├── utils.py              # miscellaneous utilities
 ├── requirements.txt      # Python dependencies
 └── README.md             # this file
