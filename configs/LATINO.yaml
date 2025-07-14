@@ -1,9 +1,9 @@
 log_subfolder: test
 
 defaults:
-  - problem: sr_x32
+  - problem: sr_x16
   - image: face
 
 seed: 42
-model: LATINO-1.5
+model: LATINO
 init_strategy: "y_noise"
