@@ -5,5 +5,5 @@ defaults:
   - image: face
 
 seed: 42
-model: LATINO
+model: LATINO  #alternatives: LATINO-1.5, LDPS, LDPS1024, PSLD, PSLD1024, LDPS-P2L, LDPS1024-P2L, TREG
 init_strategy: "y_noise"
