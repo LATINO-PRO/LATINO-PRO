@@ -426,7 +426,7 @@ def noise_pred_cond_y_PSLD_1024(
         parallel_project = transpose_model(y_guidance)
         inpainted_image = parallel_project + ortho_project
         
-        encoded_z_0 = pipe.vae.encode(inpainted_image.type(torch.float16).clip(-1,1)).latent_dist.mean * pipe.vae.config.scaling_factor
+        encoded_z_0 = pipe.vae.encode(inpainted_image.clip(-1,1)).latent_dist.mean * pipe.vae.config.scaling_factor
         inpaint_error = torch.linalg.norm((encoded_z_0 - z0_pred))
         print("gluing loss: ", inpaint_error.item())
 
