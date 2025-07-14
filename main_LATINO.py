@@ -284,8 +284,10 @@ def main(cfg: DictConfig) -> None:
         xp_log_dir = os.path.join(logdir, "results_PSLD", cfg.problem.type, cfg.log_subfolder)
     elif cfg.model == "LATINO-1.5":
         xp_log_dir = os.path.join(logdir, "results_LATINO_1.5", cfg.problem.type, cfg.log_subfolder)
-    elif cfg.model in {"LDPS", "LDPS-P2L", "LDPS1024", "LDPS1024-P2L"}:
+    elif cfg.model in {"LDPS", "LDPS1024"}:
         xp_log_dir = os.path.join(logdir, "results_LDPS", cfg.problem.type, cfg.log_subfolder)
+    elif cfg.model in {"LDPS-P2L", "LDPS1024-P2L"}:
+        xp_log_dir = os.path.join(logdir, "results_P2L", cfg.problem.type, cfg.log_subfolder)
     elif cfg.model in {"LDPS-P2L", "LDPS1024-P2L"}:
         xp_log_dir = os.path.join(logdir, "results_LDPS_P2L", cfg.problem.type, cfg.log_subfolder)
     elif cfg.model == "TREG":
@@ -499,7 +501,7 @@ def main(cfg: DictConfig) -> None:
                         noise_uncond = pipe.unet(
                             latents, 
                             timestep, 
-                            encoder_hidden_states=text_embeddings, 
+                            encoder_hidden_states=text_embeddings.float(), 
                             added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
                         ).sample
 
@@ -532,7 +534,6 @@ def main(cfg: DictConfig) -> None:
 
                     # Update text embeddings with Adam (convert back to float16)
                     text_embeddings = text_embeddings - (lr / torch.sqrt(v_hat)) * m_hat
-                    text_embeddings = text_embeddings.to(torch.float16)
 
             noise_pred, grad_nll = noise_pred_cond_y_DPS_1024_P2L(
                 latents=latents,
@@ -660,7 +661,8 @@ def main(cfg: DictConfig) -> None:
 
                 # Update parameters
                 latents = latents - (lr2 / (torch.sqrt(v_hat2) + epsilon)) * m_hat2
-                latents = latents.to(torch.float16)  # Convert back to float16
+                if cfg.model in {"LDPS-P2L"}:
+                    latents = latents.to(torch.float16)  # Convert back to float16
 
     
     with torch.no_grad():
