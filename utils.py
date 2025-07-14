@@ -135,8 +135,7 @@ def _get_x_init(y_guidance, forward_model, transpose_operator, mask, cfg):
                 b, 
                 max_iter=1e2,
                 tol=1e-5,
-                eps=1e-8,
-                verbose=False
+                eps=1e-8
             )
 
             # Step 2: Compute x_init = A^T u
