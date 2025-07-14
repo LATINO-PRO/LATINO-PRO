@@ -79,32 +79,11 @@ def main(cfg: DictConfig) -> None:
             base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
             # ───────────────────────────────────────────────────────────
-            # 1. Load the UNet (fp32)
-            # ───────────────────────────────────────────────────────────
-            pipe2 = DiffusionPipeline.from_pretrained(
-                base_model_id,
-                torch_dtype=torch.float32,       # full precision to avoid float16 issues with autograd
-                use_safetensors=True 
-            ).to(device)
-
-            unet = pipe2.unet
-
-            # ───────────────────────────────────────────────────────────
-            # 2. Load the VAE (fp32)
-            # ───────────────────────────────────────────────────────────
-            vae = AutoencoderKL.from_pretrained(
-                "stabilityai/sdxl-vae",
-                torch_dtype=torch.float32
-            ).to(device)
-
-            # ───────────────────────────────────────────────────────────
-            # 3. Build the final pipeline
+            #  Build the pipeline
             # ───────────────────────────────────────────────────────────
             pipe = DiffusionPipeline.from_pretrained(
                 base_model_id,
-                unet=unet,
-                vae=vae,
-                torch_dtype=torch.float32,
+                torch_dtype=torch.float32,  #full precision to avoid float16 issues with autograd
                 guidance_scale=0
             ).to(device)
 
