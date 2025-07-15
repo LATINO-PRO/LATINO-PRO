@@ -28,9 +28,9 @@ def noise_pred_cond_y(
         if cfg.problem.type == "super_resolution_bicubic":
             if cfg.problem.downscaling_factor == 16:
                 if t>300:
-                    delta = 6*0.01*df/(1e2*sigma_y)
+                    delta = 3*df/1e1
                 else:
-                    delta = 9*0.01*df/(1e2*sigma_y)
+                    delta = 2*df/1e1
             elif cfg.problem.downscaling_factor == 32:
                 if t>300:
                     delta = 1.5*df/(1e1)
