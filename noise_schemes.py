@@ -23,19 +23,19 @@ def noise_pred_cond_y(
             x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
             
         df = torch.norm(forward_model(x.float()) - y_guidance).item()
-        decoder_std, decoder_L = 0.02, 1
-        var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
+        # Extra regularization term
+        var_x_zt = 1-alpha_t
         if cfg.problem.type == "super_resolution_bicubic":
             if cfg.problem.downscaling_factor == 16:
                 if t>300:
-                    delta = 3*df/1e1
+                    delta = 6*0.01*df/(1e2*sigma_y)
                 else:
-                    delta = 2*df/1e1
+                    delta = 9*0.01*df/(1e2*sigma_y)
             elif cfg.problem.downscaling_factor == 32:
                 if t>300:
-                    delta = 1.5*0.01*df/(1e0*sigma_y)
+                    delta = 1.5*df/(1e1)
                 else:
-                    delta = 9*0.01*df/(1e1*sigma_y)
+                    delta = 3*df/(1e1)
         elif cfg.problem.type == 'deblurring_gaussian':
             if cfg.problem.sigma_kernel<10:
                 if t>400:
@@ -129,9 +129,7 @@ def noise_pred_cond_y_15(
     with torch.no_grad():
         x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
     df = torch.norm(forward_model(x.float()) - y_guidance).item()
-    decoder_std, decoder_L = 0.02, 1
-    var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
-    #var_x_zt = self.decoder_std**2 + (1-alpha_t)/alpha_t * self.decoder_L**2
+    var_x_zt = 1-alpha_t
     if cfg.problem.type == "super_resolution_bicubic":
         if cfg.problem.downscaling_factor == 16:
             if t>300:
@@ -530,8 +528,7 @@ def noise_pred_cond_y_PRO(
         x = pipe.vae.decode(z0_pred / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
         
     df = torch.norm(forward_model(x.float()) - y_guidance).item()
-    decoder_std, decoder_L = 0.02, 1
-    var_x_zt = decoder_std**2 + (1-alpha_t) * decoder_L**2
+    var_x_zt = 1-alpha_t
     if cfg.problem.type == "super_resolution_bicubic":
         if cfg.problem.sigma_y < 0.05:
             if cfg.problem.downscaling_factor == 16:
@@ -574,9 +571,9 @@ def noise_pred_cond_y_PRO(
                     delta = 2*df/(1e3)
             else:
                 if t>400:
-                    delta = 4*df/(1e3)
+                    delta = 4*df/(1e4)
                 else:
-                    delta = 2*df/(1e3)
+                    delta = 4*df/(1e4)
             
         elif cfg.problem.sigma_y < 0.05 and cfg.problem.sigma_kernel > 10:
             if n_steps ==4:
