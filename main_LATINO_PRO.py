@@ -74,8 +74,6 @@ def main(cfg: DictConfig) -> None:
         do_classifier_free_guidance=False
     )
 
-    text_embeddings.requires_grad = True  # Enable gradients for text embeddings
-
     # Create a random generator
     generator = torch.Generator(device=device).manual_seed(seed)
 
