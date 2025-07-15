@@ -54,10 +54,6 @@ def get_forward_model(cfg, x_clean, device):
         )
         transpose_operator = forward_model.A_adjoint
 
-    elif cfg.problem.type == 'colorization':
-        forward_model = dinv.physics.Decolorize(noise_model=noise_model).to(device)
-        transpose_operator = None
-
     else:
         raise ValueError(f"Unexpected problem.type {cfg.problem.type}")
 
