@@ -35,6 +35,10 @@ python main_LATINO.py            # uses configs/LATINO.yaml by default
 python main_LATINO_PRO.py        # uses configs/LATINO_PRO.yaml by default
 ```
 
+```configs/problem``` offers different inverse problem operators to choose from.
+
+```configs/image``` includes two examples taken from the FFHQ and AFHQ datasets.
+
 ---
 
 ## 📓 Interactive notebooks
