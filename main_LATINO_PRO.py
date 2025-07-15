@@ -64,7 +64,7 @@ def main(cfg: DictConfig) -> None:
     vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     pipe = DiffusionPipeline.from_pretrained(base_model_id, unet=unet, vae=vae, torch_dtype=torch.float16, variant="fp16", guidance_scale=0).to(device)
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    prompt = "a photo of " + cfg.image.prompt
+    prompt = cfg.image.prompt    #Ensure that the prompt starts with "a photo of"!
 
     # Encode text to conditioning
     text_embeddings, _, pooled_text_embeds, _ = pipe.encode_prompt(
