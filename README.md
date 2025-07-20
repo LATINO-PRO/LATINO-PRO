@@ -8,7 +8,7 @@
 
 ```bash
 # 1. Clone the repo and enter it
-git clone https://github.com/LATINO-PRO/LATINO-PRO.git
+git clone git@github.com:LATINO-PRO/LATINO-PRO.git
 cd LATINO-PRO
 
 # 2. (Optional) create a virtual environment
