@@ -57,13 +57,22 @@ def main(cfg: DictConfig) -> None:
     # Set the device
     device = torch.device("cuda")  # Use torch.device instead of string
 
-    if cfg.model == "TREG":
+    if cfg.model in {"TREG", "TREG1024"}:
         # Load CLIP ViT-L/14
         clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        if cfg.model == "TREG1024":
+            # Load OpenCLIP ViT-bigG
+            import open_clip
+            from torchvision.transforms.functional import to_pil_image
+            openclip_model, _, openclip_preprocess = open_clip.create_model_and_transforms(
+                'ViT-bigG-14',
+                pretrained='laion2b_s39b_b160k',
+                device=device
+            )
 
     # load stable diffusion
-    if cfg.model in {"LATINO", "LDPS1024", "PSLD1024", "LDPS1024-P2L"}:
+    if cfg.model in {"LATINO", "LDPS1024", "PSLD1024", "LDPS1024-P2L", "TREG1024"}:
         base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
         if cfg.model == "LATINO":
@@ -75,6 +84,19 @@ def main(cfg: DictConfig) -> None:
             vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
             pipe = DiffusionPipeline.from_pretrained(base_model_id, unet=unet, vae=vae, torch_dtype=torch.float16, variant="fp16", guidance_scale=0).to(device)
             pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+        elif cfg.model == "TREG1024":
+            base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+
+            vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+            
+            pipe = DiffusionPipeline.from_pretrained(
+                base_model_id,
+                vae=vae,
+                torch_dtype=torch.float16,
+                use_safetensors=True
+            ).to(device)
+
+            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
         else:
             base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
@@ -99,8 +121,8 @@ def main(cfg: DictConfig) -> None:
             do_classifier_free_guidance=False
         )
 
-        uncond_embeddings, _, _, _ = pipe.encode_prompt(
-            "",
+        uncond_embeddings, _, uncond_pooled_text_embeds, _ = pipe.encode_prompt(
+            "" if cfg.model != "TREG1024" else "out of focus, depth of field",
             device=device, 
             num_images_per_prompt=1, 
             do_classifier_free_guidance=False
@@ -139,6 +161,11 @@ def main(cfg: DictConfig) -> None:
             "time_ids": time_ids
         }
 
+        uncond_added_cond_kwargs = {
+            "text_embeds": uncond_pooled_text_embeds,  # Pass the pooled text embeddings
+            "time_ids": time_ids
+        }
+
         # Define the number of inference steps and set timesteps
         if cfg.model == "LATINO":
             num_inference_steps = 8
@@ -147,6 +174,10 @@ def main(cfg: DictConfig) -> None:
             custom_timesteps = torch.tensor([999, 874, 749, 624, 499, 374, 249, 124], device=device, dtype=torch.long)
             #custom_timesteps = torch.tensor([999, 749, 499, 249], device=device, dtype=torch.long)
             pipe.scheduler.timesteps = custom_timesteps
+        elif cfg.model == "TREG1024":
+            num_inference_steps = 200
+            guidance_scale = 5.0  # CFG scale
+            pipe.scheduler.set_timesteps(num_inference_steps, device=device)
         else:
             num_inference_steps = 500
             pipe.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -238,7 +269,7 @@ def main(cfg: DictConfig) -> None:
     x_clean = crop_to_multiple(xtemp, m=8).to(device)
     
     # To adapt the method to 1024x1024 images in case of SDv1.5
-    if cfg.model not in {"LATINO", "LDPS1024", "PSLD1024", "LDPS1024-P2L"}:
+    if cfg.model not in {"LATINO", "LDPS1024", "PSLD1024", "LDPS1024-P2L", "TREG1024"}:
         if xtemp.shape[-1] == 1024:
             noise_model_1024_to_512 = dinv.physics.GaussianNoise(sigma=0)
 
@@ -290,7 +321,7 @@ def main(cfg: DictConfig) -> None:
         xp_log_dir = os.path.join(logdir, "results_P2L", cfg.problem.type, cfg.log_subfolder)
     elif cfg.model in {"LDPS-P2L", "LDPS1024-P2L"}:
         xp_log_dir = os.path.join(logdir, "results_LDPS_P2L", cfg.problem.type, cfg.log_subfolder)
-    elif cfg.model == "TREG":
+    elif cfg.model in {"TREG", "TREG1024"}:
         xp_log_dir = os.path.join(logdir, "results_TREG", cfg.problem.type, cfg.log_subfolder)
 
     os.makedirs(xp_log_dir, exist_ok=True)
@@ -601,11 +632,6 @@ def main(cfg: DictConfig) -> None:
 
                     img_feats = clip_model.get_image_features(pixel_values=image_tensor)
                     img_feats = img_feats / img_feats.norm(dim=1, keepdim=True) # normalize
-
-                    # Output shapes
-                    #print(f"OpenCLIP features shape: {openclip_features.shape}")
-                    #print(f"CLIP ViT-L features shape: {clip_features.shape}")
-                    #print(f"Combined features shape: {combined_features.shape}")
                     
                     lr = 1e-3  # Learning rate for prompt
                     uncond_embeddings = uncond_embeddings.to(torch.float32)
@@ -638,8 +664,105 @@ def main(cfg: DictConfig) -> None:
             for k, v in log_image_dict.items():
                 save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{timestep:3d}_{k}.png'))
 
+        elif cfg.model == "TREG1024":
+            # This is a deepinverse-compatible implementation of TReg. See https://arxiv.org/pdf/2311.15658 for more details
+            with torch.no_grad():
+                skip = 5
+                prev_t = timestep - skip
+                alpha_t = pipe.scheduler.alphas_cumprod[timestep]
+                at_prev = pipe.scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else pipe.scheduler.final_alpha_cumprod.to(device)
+
+            with torch.no_grad():
+                noise_pred = pipe.unet(
+                    latents, 
+                    timestep, 
+                    encoder_hidden_states=text_embeddings, 
+                    added_cond_kwargs=added_cond_kwargs  # Include additional conditioning
+                ).sample
+            
+                noise_uncond = pipe.unet(
+                    latents, 
+                    timestep, 
+                    encoder_hidden_states=uncond_embeddings.half(), 
+                    added_cond_kwargs=uncond_added_cond_kwargs  # Include additional conditioning
+                ).sample
+                noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            if timestep%3 == 0 and timestep<850:
+                with torch.enable_grad():
+                    with torch.no_grad():
+                        #z0_pred_c = torch.sqrt(1 / alpha_t) * (latents - torch.sqrt(1 - alpha_t) * noise_pred)
+
+                        z0_pred_c = (latents - (1-alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
+                        
+                        # decode
+                        x = pipe.vae.decode(z0_pred_c / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
+
+                        z0_predy, x = noise_pred_cond_y_TReg(
+                            x=x,
+                            z0_pred=z0_pred_c,
+                            pipe=pipe,
+                            y_guidance=y_norm,
+                            forward_model=forward_model
+                        )
+
+                        # Rescale from [-1, 1] to [0, 1]
+                        x_clip = (x + 1) / 2
+                        x_clip = x_clip.clip(0, 1)
+
+                    # Apply preprocessing
+                    image_tensor = clip_processor(images=x_clip.float(), return_tensors="pt").to(device)['pixel_values']
+
+                    clip_features = clip_model.get_image_features(pixel_values=image_tensor)
+                    clip_features = clip_features / clip_features.norm(dim=1, keepdim=True) # normalize
+
+                    # x_clip is a torch tensor in [0,1], shape (B, C, H, W)
+                    # Convert the first image in the batch to PIL
+                    pil_image = to_pil_image(x_clip[0].cpu())
+                    image_tensor2 = openclip_preprocess(pil_image).unsqueeze(0).to(device)
+                    openclip_features = openclip_model.encode_image(image_tensor2)
+                    openclip_features = openclip_features / openclip_features.norm(dim=-1, keepdim=True)  # normalize
+
+                    # Concatenate features
+                    combined_features = torch.cat((openclip_features, clip_features), dim=-1)
+
+                    # Output shapes
+                    #print(f"OpenCLIP features shape: {openclip_features.shape}")
+                    #print(f"CLIP ViT-L features shape: {clip_features.shape}")
+                    #print(f"Combined features shape: {combined_features.shape}")
+                    
+                    lr = 1e-3  # Learning rate for prompt
+                    uncond_embeddings = uncond_embeddings.to(torch.float32)
+                    uncond_embeddings = uncond_embeddings.clone().detach().requires_grad_(True)
+                    optim_text = torch.optim.Adam([uncond_embeddings], lr=lr)
+
+                    for _ in range(10):
+                        optim_text.zero_grad()
+
+                        sim = combined_features @ uncond_embeddings.permute(0, 2, 1)
+                        loss = sim.mean()
+
+                        loss.backward(retain_graph=True)
+                        optim_text.step()
+
+                    noise = torch.randn_like(z0_predy).to(device)
+                    z0_ema = at_prev * z0_predy + (1-at_prev) * z0_pred_c
+                    latents = at_prev.sqrt() * z0_ema + (1-at_prev) * noise_pred
+                    latents = latents + (1-at_prev).sqrt() * at_prev.sqrt() * noise
+            else:
+                with torch.no_grad():
+                    z0t = (latents - (1-alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
+                    latents = at_prev.sqrt() * z0t + (1-at_prev).sqrt() * noise_pred
+                    x = pipe.vae.decode(z0t / pipe.vae.config.scaling_factor ).sample.clip(-1, 1)
+            # Log images
+            logdir_iter = os.path.join(xp_log_dir, 'iter')
+            os.makedirs(logdir_iter, exist_ok=True)
+            log_image_dict = {'x': x}
+
+            for k, v in log_image_dict.items():
+                save_image(torch.clamp(v * 0.5 + 0.5, 0, 1), os.path.join(logdir_iter, f'{timestep:3d}_{k}.png'))
+
         # step the scheduler
-        if cfg.model != "TREG":
+        if cfg.model not in {"TREG", "TREG1024"}:
             latents = pipe.scheduler.step(noise_pred, timestep, latents).prev_sample
 
         if cfg.model in {"LDPS", "PSLD", "LDPS1024", "PSLD1024"}:

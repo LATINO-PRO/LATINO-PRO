@@ -1,0 +1,2 @@
+[2025-07-21 14:06:34,226][root][INFO] - Loaded ViT-bigG-14 model config.
+[2025-07-21 14:08:36,986][root][INFO] - Loading pretrained ViT-bigG-14 weights (laion2b_s39b_b160k).

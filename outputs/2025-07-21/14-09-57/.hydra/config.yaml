@@ -1,0 +1,11 @@
+problem:
+  type: super_resolution_bicubic
+  downscaling_factor: 16
+  sigma_y: 0.01
+image:
+  path: ./samples/60007.png
+  prompt: a photo of a face
+log_subfolder: test
+seed: 42
+model: TREG1024
+init_strategy: y_noise
