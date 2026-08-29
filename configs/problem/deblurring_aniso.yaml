@@ -1,0 +1,5 @@
+type: deblurring_aniso
+sigma_major: 9.0
+sigma_minor: 1.5
+angle: 35.0
+sigma_y: 0.01

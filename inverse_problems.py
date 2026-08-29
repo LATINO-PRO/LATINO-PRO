@@ -1,7 +1,15 @@
-# inverse_problems.py
-import torch
-from motionblur import Kernel
 import deepinv as dinv
+import torch
+
+from motionblur import Kernel
+
+
+def disk_blur(radius):
+    grid = torch.arange(2 * radius + 7) - (2 * radius + 7) // 2
+    yy, xx = torch.meshgrid(grid, grid, indexing='ij')
+    disk = ((xx ** 2 + yy ** 2).float().sqrt() <= radius).float()
+    return (disk / disk.sum()).unsqueeze(0).unsqueeze(0)
+
 
 def get_forward_model(cfg, x_clean, device):
     noise_model = dinv.physics.GaussianNoise(sigma=cfg.problem.sigma_y)
@@ -11,13 +19,12 @@ def get_forward_model(cfg, x_clean, device):
         mask = torch.ones((1, H, W), device=x_clean.device)
         size = cfg.problem.mask_size
         # Define mask region
-        mask[:, H//2 - size//5 - 35:H//2 + size//5 - 35,
-             W//2 - 4*size//5 - 2:W//2 + 4*size//5 + 2] = 0
+        mask[:, H // 2 - size // 5 - 35:H // 2 + size // 5 - 35,
+        W // 2 - 4 * size // 5 - 2:W // 2 + 4 * size // 5 + 2] = 0
         forward_model = dinv.physics.Inpainting(
             tensor_size=x_clean.shape,
             mask=mask,
-            noise_model=noise_model,
-        ).to(device)
+            noise_model=noise_model).to(device)
         transpose_operator = forward_model.A_adjoint
 
     elif cfg.problem.type == 'deblurring_gaussian':
@@ -27,8 +34,7 @@ def get_forward_model(cfg, x_clean, device):
             img_size=x_clean.shape[1:],
             filter=filter,
             device=device,
-            noise_model=noise_model,
-        )
+            noise_model=noise_model)
         transpose_operator = forward_model.A_adjoint
 
     elif cfg.problem.type == 'deblurring_motion':
@@ -39,8 +45,27 @@ def get_forward_model(cfg, x_clean, device):
             img_size=x_clean.shape[1:],
             filter=kernel_torch,
             device=device,
-            noise_model=noise_model,
-        )
+            noise_model=noise_model)
+        transpose_operator = forward_model.A_adjoint
+
+    elif cfg.problem.type == 'deblurring_disk':
+        filter = disk_blur(cfg.problem.radius)
+        forward_model = dinv.physics.BlurFFT(
+            img_size=x_clean.shape[1:],
+            filter=filter,
+            device=device,
+            noise_model=noise_model)
+        transpose_operator = forward_model.A_adjoint
+
+    elif cfg.problem.type == 'deblurring_aniso':
+        filter = dinv.physics.blur.gaussian_blur(
+            sigma=(cfg.problem.sigma_major, cfg.problem.sigma_minor),
+            angle=cfg.problem.angle)
+        forward_model = dinv.physics.BlurFFT(
+            img_size=x_clean.shape[1:],
+            filter=filter,
+            device=device,
+            noise_model=noise_model)
         transpose_operator = forward_model.A_adjoint
 
     elif cfg.problem.type == 'super_resolution_bicubic':

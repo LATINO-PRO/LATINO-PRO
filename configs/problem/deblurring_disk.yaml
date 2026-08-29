@@ -1,0 +1,3 @@
+type: deblurring_disk
+radius: 9
+sigma_y: 0.01

@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.idea/
+.venv/
+*.log
+
+# Datasets are fetched by data_prep.py; only the two SNGFaces fixtures are tracked, because fetch_sngfaces needs them.
+data/*
+!data/sngfaces_metadata.json
+!data/sngfaces_1024_fileids.json
+
+# Run outputs
+batch_results*/
+pod_results*/
+bugfix_check/
+delta_sweep/
+vae_domain_check/
+prior_domain_check/
+/2503.12615v2.pdf
